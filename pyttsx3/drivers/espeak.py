@@ -7,6 +7,8 @@ import wave
 from tempfile import NamedTemporaryFile
 import logging
 
+logger = logging.getLogger(__name__)
+
 if platform.system() == "Windows":
     import winsound
 
@@ -40,6 +42,7 @@ class EspeakDriver:
                 EspeakDriver._defaultVoice = "gmw/en"  # Adjust this as needed
             EspeakDriver._moduleInitialized = True
         self._proxy = proxy
+        self._queue = []
         self._looping = False
         self._stopping = False
         self._speaking = False
@@ -152,12 +155,6 @@ class EspeakDriver:
         else:
             raise KeyError("unknown property %s" % name)
 
-    def save_to_file(self, text, filename):
-        """
-        Save the synthesized speech to the specified filename.
-        """
-        self._save_file = filename
-        self._text_to_say = text
 
     def _start_synthesis(self, text):
         self._proxy.setBusy(True)
@@ -174,112 +171,149 @@ class EspeakDriver:
             raise
 
     def _onSynth(self, wav, numsamples, events):
-        if not self._speaking:
-            return 0
+        logger.debug(f"[DEBUG] Synth callback invoked with {numsamples} samples")
+        logger.debug(f"[DEBUG] Speaking: {self._speaking}")
+        logger.debug(f"[DEBUG] Queue: {self._queue}")
 
-        # Process each event in the current callback
-        i = 0
-        while True:
-            event = events[i]
+        for event in events:
+            logger.debug(f"[DEBUG] Event: {event.type}")
+
             if event.type == _espeak.EVENT_LIST_TERMINATED:
-                break
-            if event.type == _espeak.EVENT_WORD:
-                if self._text_to_say:
-                    start_index = event.text_position - 1
-                    end_index = start_index + event.length
-                    word = self._text_to_say[start_index:end_index]
-                else:
-                    word = "Unknown"
-                self._proxy.notify(
-                    "started-word",
-                    name=word,
-                    location=event.text_position,
-                    length=event.length,
-                )
+                logger.debug("[DEBUG] Event: LIST_TERMINATED - Finalizing.")
 
-            elif event.type == _espeak.EVENT_MSG_TERMINATED:
-                # Final event indicating synthesis completion
+                # Check if we were saving to a file
                 if self._save_file:
                     try:
                         with wave.open(self._save_file, "wb") as f:
-                            f.setnchannels(1)  # Mono
-                            f.setsampwidth(2)  # 16-bit samples
-                            f.setframerate(22050)  # 22,050 Hz sample rate
+                            f.setnchannels(1)
+                            f.setsampwidth(2)
+                            f.setframerate(22050)
                             f.writeframes(self._data_buffer)
-                        print(f"Audio saved to {self._save_file}")
+                        logger.debug(f"[DEBUG] Audio saved to {self._save_file}")
                     except Exception as e:
-                        raise RuntimeError(f"Error saving WAV file: {e}")
-                else:
-                    try:
-                        with NamedTemporaryFile(
-                            suffix=".wav", delete=False
-                        ) as temp_wav:
-                            with wave.open(temp_wav, "wb") as f:
-                                f.setnchannels(1)  # Mono
-                                f.setsampwidth(2)  # 16-bit samples
-                                f.setframerate(22050)  # 22,050 Hz sample rate
-                                f.writeframes(self._data_buffer)
-
-                            temp_wav_name = temp_wav.name
-                            temp_wav.flush()
-
-                        # Playback functionality (for say method)
-                        if platform.system() == "Darwin":  # macOS
-                            subprocess.run(["afplay", temp_wav_name], check=True)
-                        elif platform.system() == "Linux":
-                            os.system(f"aplay {temp_wav_name} -q")
-                        elif platform.system() == "Windows":
-                            winsound.PlaySound(temp_wav_name, winsound.SND_FILENAME)
-
-                        # Remove the file after playback
-                        os.remove(temp_wav_name)
-                    except Exception as e:
-                        print(f"Playback error: {e}")
-
-                # Clear the buffer and mark as finished
-                self._data_buffer = b""
+                        logger.error(f"[ERROR] Failed to save audio to file: {e}")
+                    finally:
+                        self._data_buffer = b""  # Clear buffer
+                        self._save_file = None  # Reset save_file flag
+                
+                # Reset speaking and notify completion
                 self._speaking = False
                 self._proxy.notify("finished-utterance", completed=True)
-                self._proxy.setBusy(False)
-                self.endLoop()
-                break
+                self._proxy.setBusy(False)  # Reset busy state
 
-            i += 1
-
-        # Accumulate audio data if available
+        # Process synthesized audio
         if numsamples > 0:
-            self._data_buffer += ctypes.string_at(
-                wav, numsamples * ctypes.sizeof(ctypes.c_short)
-            )
+            self._data_buffer += ctypes.string_at(wav, numsamples * ctypes.sizeof(ctypes.c_short))
 
         return 0
+
+    def _playback_audio(self):
+        try:
+            with NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
+                with wave.open(temp_wav, "wb") as f:
+                    f.setnchannels(1)
+                    f.setsampwidth(2)
+                    f.setframerate(22050)
+                    f.writeframes(self._data_buffer)
+
+                temp_wav_name = temp_wav.name
+                temp_wav.flush()
+
+            logger.debug(f"[DEBUG] Playback temp file: {temp_wav_name}")
+
+            if platform.system() == "Darwin":
+                subprocess.run(["afplay", temp_wav_name], check=True)
+            elif platform.system() == "Linux":
+                os.system(f"aplay {temp_wav_name} -q")
+            elif platform.system() == "Windows":
+                winsound.PlaySound(temp_wav_name, winsound.SND_FILENAME)
+
+            os.remove(temp_wav_name)
+        except Exception as e:
+            logger.error(f"[ERROR] Playback error: {e}")
 
     def endLoop(self):
         self._looping = False
 
-    def startLoop(self):
-        first = True
+
+    def startLoop(self, external=False):
+        if self._looping:
+            logger.debug("[DEBUG] Loop already active; skipping startLoop.")
+            return
+
+        logger.debug("[DEBUG] Starting loop")
         self._looping = True
+        self._is_external_loop = external
+
+        timeout_counter = 0  # Timeout counter for debugging purposes
+
         while self._looping:
-            if not self._looping:
+            logger.debug(f"[DEBUG] Loop state - Queue: {self._queue}, Speaking: {self._speaking}")
+
+            # Timeout logic to avoid infinite loops during debugging
+            timeout_counter += 1
+            if timeout_counter > 5000:  # Example: 5000 iterations as a safeguard
+                logger.error("[ERROR] Loop timeout - Exiting for debugging.")
+                self._looping = False
                 break
-            if first:
-                self._proxy.setBusy(False)
-                first = False
-                if self._text_to_say:
+
+            # If not currently speaking, fetch the next task in the queue
+            if not self._speaking and self._queue:
+                task = self._queue.pop(0)
+                if isinstance(task, dict) and "filename" in task:
+                    logger.debug(f"[DEBUG] Processing save-to-file task: {task}")
+                    self._save_file = task["filename"]
+                    self._text_to_say = task["text"]
+                    self._proxy.setBusy(True)  # Mark as busy when processing a task
                     self._start_synthesis(self._text_to_say)
-            self.iterate()
+                else:
+                    logger.debug(f"[DEBUG] Processing say task: {task}")
+                    self._save_file = None
+                    self._text_to_say = task
+                    self._proxy.setBusy(True)  # Mark as busy when processing a task
+                    self._start_synthesis(self._text_to_say)
+
+            # Exit the loop when there are no tasks and speaking has stopped
+            if not self._speaking and not self._queue:
+                logger.debug("[DEBUG] Queue is empty and not speaking; exiting loop.")
+                self._looping = False
+
+            try:
+                if external:
+                    next(self.iterate())
+                else:
+                    time.sleep(0.01)
+            except StopIteration:
+                logger.debug("[DEBUG] Stopping loop due to StopIteration")
+                break
+
+        self._proxy.setBusy(False)  # Ensure the proxy is not busy after loop ends
+        logger.debug("[DEBUG] Exiting loop.")
+        
+    def say(self, text):
+        logger.debug(f"[DEBUG] EspeakDriver.say called with text: {text}")
+        self._queue.append(text)  # Add text to the queue
+        logger.debug(f"[DEBUG] Updated Queue: {self._queue}")
+        if not self._looping:
+            self.startLoop()
+
+    def save_to_file(self, text, filename):
+        logger.debug(f"[DEBUG] EspeakDriver.save_to_file called with text: {text} and filename: {filename}")
+        self._queue.append({"text": text, "filename": filename})  # Add save-to-file task
+        logger.debug(f"[DEBUG] Updated Queue: {self._queue}")
+        if not self._looping:
+            self.startLoop()
+            
+    def runAndWait(self):
+        """
+        Run the event loop until all tasks in the queue are processed.
+        """
+        logger.debug("[DEBUG] EspeakDriver.runAndWait called")
+        if not self._looping:
+            self.startLoop()
+
+        # Wait for the queue and speaking tasks to complete
+        while self._queue or self._speaking:
             time.sleep(0.01)
 
-    def iterate(self):
-        if not self._looping:
-            return
-        if self._stopping:
-            _espeak.Cancel()
-            self._stopping = False
-            self._proxy.notify("finished-utterance", completed=False)
-            self._proxy.setBusy(False)
-            self.endLoop()
-
-    def say(self, text):
-        self._text_to_say = text
+        logger.debug("[DEBUG] runAndWait completed - Queue empty, not speaking.")
